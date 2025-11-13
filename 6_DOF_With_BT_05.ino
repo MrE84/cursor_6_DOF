@@ -8,6 +8,7 @@
 #include <Adafruit_PWMServoDriver.h>
 #include <SoftwareSerial.h>
 #include <LiquidCrystal_I2C.h>
+#include <math.h>
 
 // Initialize LCD display
 LiquidCrystal_I2C lcd(0x27,16,4);
@@ -22,6 +23,21 @@ const int MAX_PULSE_WIDTH = 2500;
 const int DEFAULT_PULSE_WIDTH = 1500;
 const int FREQUENCY = 50;
 const float FREQUENCY_SCALE = (float)FREQUENCY * 4096 / 1000000;
+
+// Arm geometry for inverse kinematics (millimeters)
+const float BASE_HGT  = 90.2f;  // L1  base height     (J1 -> J2)
+const float HUMERUS  = 105.0f;  // L2  shoulder link   (J2 -> J3)
+const float ULNA     = 127.0f;  // L3  elbow link      (J3 -> J4)
+const float GRIPPER  = 75.0f;   // L4  wrist -> tool   (J4 -> TCP)
+
+const float RAD_TO_DEG = 180.0f / PI;
+const float DEG_TO_RAD = PI / 180.0f;
+
+// Servo calibration helpers (adjust to match the physical build)
+const float SERVO_NEUTRAL[6]   = {100.0f, 90.0f, 110.0f, 95.0f, 180.0f,   0.0f};
+const float SERVO_DIRECTION[6] = {  1.0f,  1.0f,  -1.0f,  1.0f,   1.0f,   1.0f};
+const float SERVO_SCALE[6]     = {  1.0f,  1.0f,   1.0f,  1.0f,   1.0f,   1.0f};
+
 // Define maximum moves and servos
 const int moveCount = 10;
 const int servoNumber = 6;
@@ -38,12 +54,14 @@ int indexRecord = 0;
 int pulseWidth(int angle);
 void executeCommand(String command);
 void printServoPulseWidths();
-void MoveToPick();
 void MoveToStart();
 void moveServo(int servoChannel, int angle);
 void StartRecordingMovements();
 void StopRecordingMovements();
 void PlayRecordedMovements();
+bool inverseKinematics(float x, float y, float z, float wristTiltDeg, float& hipDeg, float& shoulderDeg, float& elbowDeg, float& wristDeg);
+bool moveToPose(float x, float y, float z, float wristTiltDeg, float clawAngle);
+bool parseFloats(String args, float* values, int expectedCount);
 
 
 //////////////////// Setup function///////////////////////////////////////////////////////
@@ -202,34 +220,6 @@ void printServoPulseWidths() {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-// void MoveToPick() {
-//     // Define the sequence of angles for each servo in the pick-up motion
-//     int angles[10][servoNumber] = {
-//         // HIP, WAIST, SHOULDER, ELBOW, WRIST, CLAW
-//         {125, 180, 190, 180, 190, 0},    // Initial position
-//         {150, 110, 100, 190, 90, 0}, // Move to above the object
-//         {150, 50, 180, 150, 180, 0}, // Lower towards the object
-//         {150, 50, 180, 150, 180, 0},// Close claw to grab the object
-//         {150, 90, 100, 150, 90, 0},// Lift the object
-//         {125, 180, 190, 180, 190, 0},    // Return to initial position with object
-//         {150, 110, 100, 190, 90, 0}, // Move the object
-//         {150, 40, 180, 150, 180, 0}, // Lower  the object
-//         {150, 40, 180, 150, 180, 0}, // OPEN claw to RELEASE the object
-//         {125, 180, 190, 180, 190, 0}    // Return to initial position with object
-//     };
-//         // Execute the sequence
-//     for (int i = 0; i < 10; i++) {
-//         for (int j = 0; j < servoNumber; j++) {
-//             pwm.setPWM(j + 1, 0, pulseWidth(angles[i][j]));
-//         }
-//         delay(2000); // Wait for 1 second between each step for smooth movement
-//     }
-
-//     // Optionally, open the claw to release the object at the end
-//     // pwm.setPWM(6, 0, pulseWidth(0)); // Open the claw
-// }
-/////////////////////////////////////////////////////////////////////////////////////////////////
 void MoveToStart() {
     
     servoAngles[0] = 100; //HIP servo
@@ -279,6 +269,102 @@ int pulseWidth(int angle) {
 }
 //////////////////////////////////////////////////////////////////////////////////////////////
 
+bool parseFloats(String args, float* values, int expectedCount) {
+    args.trim();
+    int collected = 0;
+    while (collected < expectedCount && args.length() > 0) {
+        int separator = args.indexOf(' ');
+        String token;
+        if (separator == -1) {
+            token = args;
+            args = "";
+        } else {
+            token = args.substring(0, separator);
+            args = args.substring(separator + 1);
+        }
+        token.trim();
+        if (token.length() == 0) {
+            args.trim();
+            continue;
+        }
+        values[collected++] = token.toFloat();
+        args.trim();
+    }
+    return collected == expectedCount;
+}
+
+bool inverseKinematics(float x, float y, float z, float wristTiltDeg, float& hipDeg, float& shoulderDeg, float& elbowDeg, float& wristDeg) {
+    float planarRadius = sqrt(x * x + y * y);
+    float wristPitchRad = wristTiltDeg * DEG_TO_RAD;
+    float hipRad = atan2(y, x);
+    hipDeg = hipRad * RAD_TO_DEG;
+
+    float wristZ = z - BASE_HGT;
+    float wristX = planarRadius - (GRIPPER * cos(wristPitchRad));
+    float wristY = wristZ - (GRIPPER * sin(wristPitchRad));
+
+    float reach = sqrt((wristX * wristX) + (wristY * wristY));
+    float reachMax = HUMERUS + ULNA;
+    float reachMin = fabs(HUMERUS - ULNA);
+
+    if (reach > reachMax || reach < reachMin) {
+        return false;
+    }
+
+    if (reach < 1e-3f) {
+        reach = 1e-3f;
+    }
+
+    float shoulderOffset = atan2(wristY, wristX);
+    float shoulderInner = acos(constrain((HUMERUS * HUMERUS + reach * reach - ULNA * ULNA) / (2.0f * HUMERUS * reach), -1.0f, 1.0f));
+    float shoulderRad = shoulderOffset + shoulderInner;
+
+    float elbowInner = acos(constrain((HUMERUS * HUMERUS + ULNA * ULNA - reach * reach) / (2.0f * HUMERUS * ULNA), -1.0f, 1.0f));
+    float elbowRad = PI - elbowInner;
+
+    float wristRad = wristPitchRad - shoulderRad - elbowRad;
+
+    shoulderDeg = shoulderRad * RAD_TO_DEG;
+    elbowDeg = elbowRad * RAD_TO_DEG;
+    wristDeg = wristRad * RAD_TO_DEG;
+    return true;
+}
+
+bool moveToPose(float x, float y, float z, float wristTiltDeg, float clawAngle) {
+    float hipDeg = 0.0f;
+    float shoulderDeg = 0.0f;
+    float elbowDeg = 0.0f;
+    float wristDeg = 0.0f;
+
+    if (!inverseKinematics(x, y, z, wristTiltDeg, hipDeg, shoulderDeg, elbowDeg, wristDeg)) {
+        Serial.println("IK target is out of reach.");
+        bt1.println("IK target is out of reach.");
+        return false;
+    }
+
+    int servoTargets[6];
+    servoTargets[0] = constrain(int(SERVO_NEUTRAL[0] + hipDeg * SERVO_DIRECTION[0] * SERVO_SCALE[0]), 0, 180);
+    servoTargets[1] = constrain(int(SERVO_NEUTRAL[1] + shoulderDeg * SERVO_DIRECTION[1] * SERVO_SCALE[1]), 0, 180);
+    servoTargets[2] = constrain(int(SERVO_NEUTRAL[2] + elbowDeg * SERVO_DIRECTION[2] * SERVO_SCALE[2]), 0, 180);
+    servoTargets[3] = constrain(int(SERVO_NEUTRAL[3] + wristDeg * SERVO_DIRECTION[3] * SERVO_SCALE[3]), 0, 180);
+    servoTargets[4] = servoAngles[4]; // Preserve current wrist rotate
+    servoTargets[5] = constrain(int(clawAngle), 0, 180);
+
+    for (int i = 0; i < 6; i++) {
+        moveServo(i + 1, servoTargets[i]);
+    }
+
+    Serial.print("MoveToPose -> x: "); Serial.print(x);
+    Serial.print(" y: "); Serial.print(y);
+    Serial.print(" z: "); Serial.print(z);
+    Serial.print(" wrist: "); Serial.println(wristTiltDeg);
+    bt1.print("MoveToPose -> x: "); bt1.print(x);
+    bt1.print(" y: "); bt1.print(y);
+    bt1.print(" z: "); bt1.print(z);
+    bt1.print(" wrist: "); bt1.println(wristTiltDeg);
+    return true;
+}
+
 void executeCommand(String command) {
     command.trim(); // Trim whitespace
     command.toUpperCase(); // Convert to upper case for case-insensitive comparison
@@ -299,13 +385,24 @@ void executeCommand(String command) {
     };
 
     // Check for special commands first
-    if (command == "MOVE_TO_PICK") {
-        MoveToPick();
-        Serial.println("Executing MoveToPick sequence");
-    } else if (command == "PLAY_MOVEMENTS") {
+    if (command == "PLAY_MOVEMENTS") {
         waitingForConfirmation = true;
         Serial.println("Are you sure you want to play movements? (YES/NO)");
         bt1.println("Are you sure you want to play movements? (YES/NO)"); // Send confirmation request over Bluetooth
+    }
+    
+    else if (command.startsWith("MOVE_IK ")) {
+        float params[5];
+        if (!parseFloats(command.substring(8), params, 5)) {
+            Serial.println("MOVE_IK expects 5 values: X Y Z WristPitchDeg ClawAngle");
+            bt1.println("MOVE_IK expects 5 values: X Y Z WristPitchDeg ClawAngle");
+        } else {
+            bool ok = moveToPose(params[0], params[1], params[2], params[3], params[4]);
+            if (!ok) {
+                Serial.println("MOVE_IK failed: pose unreachable");
+                bt1.println("MOVE_IK failed: pose unreachable");
+            }
+        }
     }
     
     else if (command == "GETVALUE") {
