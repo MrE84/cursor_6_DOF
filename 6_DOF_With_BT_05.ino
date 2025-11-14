@@ -15,7 +15,7 @@ LiquidCrystal_I2C lcd(0x27,16,4);
 // Initialize servo driver
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
 // Initialize Bluetooth module
-SoftwareSerial bt1(6,7); /* (Rx,Tx) */ for Jakes PCB
+SoftwareSerial bt1(2,3); /* (Rx,Tx) */
 
 // Define servo motor parameters
 const int MIN_PULSE_WIDTH = 500;
@@ -29,9 +29,6 @@ const float BASE_HGT  = 90.2f;  // L1  base height     (J1 -> J2)
 const float HUMERUS  = 105.0f;  // L2  shoulder link   (J2 -> J3)
 const float ULNA     = 127.0f;  // L3  elbow link      (J3 -> J4)
 const float GRIPPER  = 75.0f;   // L4  wrist -> tool   (J4 -> TCP)
-
-const float RAD_TO_DEG = 180.0f / PI;
-const float DEG_TO_RAD = PI / 180.0f;
 
 // Servo calibration helpers (adjust to match the physical build)
 const float SERVO_NEUTRAL[6]   = {100.0f, 90.0f, 110.0f, 95.0f, 180.0f,   0.0f};
@@ -49,6 +46,9 @@ bool waitingForConfirmation = false; // safety check, stop user from acidently r
 bool isRecord = false;
 bool isPlay = false;
 int indexRecord = 0;
+int playbackDelayMs = 1000; // default delay between recorded moves
+int servoStepDelayMs = 0;   // delay between incremental servo steps (0 = instant)
+int servoStepSizeDeg = 1;   // degrees per incremental step when speed limiting is enabled
 
 // Function Prototypes function must be declared before it is called unless it is defined above the point where it is called.
 int pulseWidth(int angle);
@@ -185,13 +185,7 @@ void PlayRecordedMovements() {
             bt1.print(" Pulse Width: "); bt1.println(pulse);  // Added
             pwm.setPWM(j + 1, 0, pulse);
         }
-        delay(1000);  // Delay between moves, adjust as needed
-    }
-    for (int i = 0; i < indexRecord; i++) {
-        lcd.setCursor(0, 1);
-        lcd.print("Move: ");
-        lcd.print(i + 1); // Update the move number on the LCD
-        // ... rest of the playback code
+        delay(playbackDelayMs);  // Delay between moves, adjust as needed
     }
 
     isPlay = false;
@@ -248,17 +242,35 @@ void MoveToStart() {
 // Correct the moveServo to use 0-based index for servoAngles array
 void moveServo(int servoChannel, int angle) {
     int servoIndex = servoChannel - 1; // Convert 1-based index to 0-based index
-    servoAngles[servoIndex] = angle;
-    int pulse = pulseWidth(angle);
+    int targetAngle = constrain(angle, 0, 180);
+    int currentAngle = servoAngles[servoIndex];
+    int finalPulse = 0;
+
+    if (servoStepDelayMs > 0 && servoStepSizeDeg > 0 && currentAngle != targetAngle) {
+        int step = (targetAngle > currentAngle) ? servoStepSizeDeg : -servoStepSizeDeg;
+        while (currentAngle != targetAngle) {
+            if ((step > 0 && currentAngle + step > targetAngle) || (step < 0 && currentAngle + step < targetAngle)) {
+                currentAngle = targetAngle;
+            } else {
+                currentAngle += step;
+            }
+            servoAngles[servoIndex] = currentAngle;
+            finalPulse = pulseWidth(currentAngle);
+            pwm.setPWM(servoChannel, 0, finalPulse);
+            delay(servoStepDelayMs);
+        }
+    } else {
+        servoAngles[servoIndex] = targetAngle;
+        finalPulse = pulseWidth(targetAngle);
+        pwm.setPWM(servoChannel, 0, finalPulse);
+    }
 
     Serial.print("Moving Servo "); Serial.print(servoChannel);
-    Serial.print(" to Angle: "); Serial.print(angle);
-    Serial.print(" (Pulse Width: "); Serial.print(pulse); Serial.println(")");
+    Serial.print(" to Angle: "); Serial.print(targetAngle);
+    Serial.print(" (Pulse Width: "); Serial.print(finalPulse); Serial.println(")");
     bt1.print("Moving Servo "); bt1.print(servoChannel);
-    bt1.print(" to Angle: "); bt1.print(angle);
-    bt1.print(" (Pulse Width: "); bt1.print(pulse); bt1.println(")"); // Adding Bluetooth print
-
-    pwm.setPWM(servoChannel, 0, pulse);
+    bt1.print(" to Angle: "); bt1.print(targetAngle);
+    bt1.print(" (Pulse Width: "); bt1.print(finalPulse); bt1.println(")"); // Adding Bluetooth print
 }
 
 
@@ -401,6 +413,48 @@ void executeCommand(String command) {
             if (!ok) {
                 Serial.println("MOVE_IK failed: pose unreachable");
                 bt1.println("MOVE_IK failed: pose unreachable");
+            }
+        }
+    }
+    
+    else if (command.startsWith("SET_PLAYBACK_DELAY ")) {
+        int newDelay = command.substring(strlen("SET_PLAYBACK_DELAY ")).toInt();
+        if (newDelay <= 0) {
+            Serial.println("SET_PLAYBACK_DELAY requires a positive integer (milliseconds).");
+            bt1.println("SET_PLAYBACK_DELAY requires a positive integer (milliseconds).");
+        } else {
+            playbackDelayMs = newDelay;
+            Serial.print("Playback delay set to "); Serial.print(playbackDelayMs); Serial.println(" ms");
+            bt1.print("Playback delay set to "); bt1.print(playbackDelayMs); bt1.println(" ms");
+        }
+    }
+
+    else if (command.startsWith("SET_SERVO_SPEED ")) {
+        String args = command.substring(strlen("SET_SERVO_SPEED "));
+        args.trim();
+        int separator = args.indexOf(' ');
+        if (separator == -1) {
+            Serial.println("SET_SERVO_SPEED expects: StepDegrees DelayMs (DelayMs can be 0).");
+            bt1.println("SET_SERVO_SPEED expects: StepDegrees DelayMs (DelayMs can be 0).");
+        } else {
+            int stepSize = args.substring(0, separator).toInt();
+            int delayMs = args.substring(separator + 1).toInt();
+            if (stepSize <= 0 || delayMs < 0) {
+                Serial.println("Invalid values. StepDegrees must be >0 and DelayMs >=0.");
+                bt1.println("Invalid values. StepDegrees must be >0 and DelayMs >=0.");
+            } else {
+                servoStepSizeDeg = stepSize;
+                servoStepDelayMs = delayMs;
+                Serial.print("Servo speed set: step ");
+                Serial.print(servoStepSizeDeg);
+                Serial.print(" deg, delay ");
+                Serial.print(servoStepDelayMs);
+                Serial.println(" ms");
+                bt1.print("Servo speed set: step ");
+                bt1.print(servoStepSizeDeg);
+                bt1.print(" deg, delay ");
+                bt1.print(servoStepDelayMs);
+                bt1.println(" ms");
             }
         }
     }
